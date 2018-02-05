@@ -192,6 +192,7 @@ class SqlBuilder
     ];
   }
   public function execute($data) {
+    $params = $data;
     if ($this->_db instanceof mysqli) {
       $arr = [];
       // PHP >= 5.3
