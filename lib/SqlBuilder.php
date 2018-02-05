@@ -2,11 +2,17 @@
 
 namespace lib;
 
+// version 0.2
+
 use Pdo;
 use BadMethodCallException;
 use mysqli;
+use InvalidArgumentException;
 
 function _add_quote($key) {
+  if (strpos($key, "(")) {
+    return $key;
+  }
   if (strpos($key, ".")) {
     return implode(".", array_map("lib\\_add_quote", explode(".", $key)));
   }
@@ -35,11 +41,13 @@ class SqlBuilder
   private $_where = [];
   private $_having = [];
   private $_order_by = "";
+  private $_group_by = "";
   private $_limit = 100;
   private $_offset = 0;
 
   public $sql;
   public $stmt;
+  public $log;
 
   public function __construct($db) {
     $this->_db = $db;
@@ -75,9 +83,19 @@ class SqlBuilder
     }
     return "$key";
   }
+  public function _str_where_to_array($where) {
+    if (preg_match("/^(.+?)\s*(=|<=|<>|>=|!=|like)\s*(.+)/", $where, $m)) {
+      array_shift($m);
+      return $m;
+    }
+    throw new InvalidArgumentException("where ".$where);
+  }
   public function where(array $where) {
     $where_str_arr = $where_params = [];
     foreach ($where as $w) {
+      if (is_string($w)) {
+        $w = self::_str_where_to_array($w);
+      }
       $key = self::_trim_table($w[0]);
       if (count($w) == 2) {
         $where_str_arr[] = _add_quote($w[0])."=:".$key;
@@ -95,6 +113,9 @@ class SqlBuilder
   public function having(array $where) {
     $where_str_arr = $where_params = [];
     foreach ($where as $w) {
+      if (is_string($w)) {
+        $w = self::_str_where_to_array($w);
+      }
       if (count($w) == 2) {
         $where_str_arr[] = _add_quote($w[0])."=:$w[0]";
         $where_params[] = $w[1];
@@ -106,6 +127,10 @@ class SqlBuilder
     }
     $where_str = implode(" AND ", $where_str_arr);
     $this->_having = [ $where_str, $where_params ];
+    return $this;
+  }
+  public function groupBy(array $fields) {
+    $this->_group_by = implode(",", array_map('lib\\_add_quote', $fields));
     return $this;
   }
   public function orderBy(array $fields) {
@@ -133,8 +158,8 @@ class SqlBuilder
     }
     return $this->stmt->fetchAll(PDO::FETCH_ASSOC);
   }
-  public function count() {
-    $this->_select = "COUNT(*) c";
+  public function count($fields = '*') {
+    $this->_select = "COUNT($fields) c";
     $row = $this->getOne();
     return $row['c'];
   }
@@ -151,14 +176,22 @@ class SqlBuilder
       $where = "WHERE $where_str";
       $where_params = $this->_where[1];
     }
+    $having = "";
+    $having_params = [];
+    if ($this->_having) {
+      $having_str = $this->_having[0];
+      $having = "WHERE $having_str";
+      $having_params = $this->_having[1];
+    }
+    $group_by = $this->_group_by ? "GROUP BY $this->_group_by" : "";
     $order_by = $this->_order_by ? "ORDER BY $this->_order_by" : "";
     return [
-      "SELECT $this->_select FROM $this->_from $join $where $order_by LIMIT $this->_limit OFFSET $this->_offset",
+      "SELECT $this->_select FROM $this->_from $join $where $group_by $order_by $having
+        LIMIT $this->_limit OFFSET $this->_offset",
       $where_params
     ];
   }
   public function execute($data) {
-    $log = Service::get('log');
     if ($this->_db instanceof mysqli) {
       $arr = [];
       // PHP >= 5.3
@@ -186,6 +219,7 @@ class SqlBuilder
         }
         array_unshift($params, implode('', $type_arr));
         $sql = preg_replace("/:[\w_]+/", '?', $this->sql);
+        $this->sql = $sql;
         $this->stmt = $this->_db->prepare($sql);
         if ($this->stmt == false) {
           return false;
@@ -196,12 +230,41 @@ class SqlBuilder
       } else {
         $this->stmt = $this->_db->prepare($this->sql);
       }
-      if ($log) $log->DEBUG("SQL mysqli %s %s", $this->sql, json_encode($params));
+      $this->_full_sql = self::_get_full_sql_question_mark($this->sql, $params);
+      if ($this->log) {
+        $this->log->INFO("SQL: %s", $this->_full_sql);
+      }
       return $this->stmt->execute();
     }
-    if ($log) $log->DEBUG("SQL pdo_mysql %s %s", $this->sql, json_encode($data));
+    // Pdo
+    $this->_full_sql = self::_get_full_sql_auto_detect($this->sql, $params);
+    if ($this->log) {
+      $this->log->INFO("SQL: %s", $this->_full_sql);
+    }
     $this->stmt = $this->_db->prepare($this->sql);
-    return $this->stmt->execute($data);
+    return $this->stmt->execute($params);
+  }
+  private static function _get_full_sql_auto_detect($sql, $params) {
+    if (strpos($sql, '?')!== false) {
+      return self::_get_full_sql_question_mark($sql, $params);
+    }
+    return self::_get_full_sql_colon($sql, $params);
+  }
+  private static function _get_full_sql_colon($sql, $params) {
+    return \preg_replace_callback('/:([\w_]+)/', function ($m) use($params) {
+      $index = $m[1];
+      return "'$params[$index]'";
+    }, $sql);
+  }
+  private static function _get_full_sql_question_mark($sql, $params) {
+    $indicator_list_str = \array_shift($params);
+    $n = \strlen($indicator_list_str);
+    for ($i=0; $i < $n; $i++) { 
+      $ii = \strpos($sql, '?');
+      $v = $indicator_list_str[$i] == 's' ? "'$params[$i]'" : $params[$i];
+      $sql = \substr_replace($sql, $v, $ii, 1);
+    }
+    return $sql;
   }
   public function update($data) {
     $_set_str_arr = [];
